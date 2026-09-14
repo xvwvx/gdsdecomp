@@ -1,0 +1,187 @@
+# Builds GDRE Tools (gdsdecomp) with double-precision floats (precision=double).
+#
+# This workflow is deliberately a trimmed copy of .github/workflows/all_builds.yml:
+# same env variable names, same matrix field names, same actions and step order.
+# Its deliberate differences are:
+#   - "precision=double" is appended to SCONSFLAGS
+#   - the matrix holds a single Windows editor entry
+#   - it is started manually (workflow_dispatch) instead of on push/pull_request
+#   - the test/sanity checks run inline, because there is no separate test job
+#
+# gdsdecomp is a Godot *module*, not a standalone project: the build must run
+# from inside a checkout of the Godot fork it is pinned to, with this repository
+# placed at modules/gdsdecomp.
+#
+# precision=double makes Godot's real_t a double (REAL_T_IS_DOUBLE) and is only
+# supported on 64-bit targets. windows-latest is x86_64 and Godot defaults to the
+# host arch, so no explicit arch= is needed; a 32-bit build would fail loudly
+# instead of silently producing a wrong artifact.
+name: Build GDRE Tools (double precision)
+
+on:
+  workflow_dispatch:
+    inputs:
+      scons-extra-flags:
+        description: "Extra SCons flags, appended after the shared flags"
+        type: string
+        default: ""
+      upload-artifact:
+        description: "Upload the built binaries as a workflow artifact"
+        type: boolean
+        default: true
+
+# Global Settings
+env:
+  GODOT_REPOSITORY: nikitalita/godot
+  GODOT_MAIN_SYNC_REF: gdre-wb-f964fa714f5
+  # Same flags as all_builds.yml, plus precision=double (the point of this workflow).
+  SCONSFLAGS: verbose=yes warnings=all werror=no module_text_server_fb_enabled=yes minizip=yes deprecated=yes angle=yes accesskit=no precision=double
+  # Only consumed by template_* matrix entries; kept for parity with all_builds.yml.
+  SCONSFLAGS_TEMPLATE: disable_path_overrides=no no_editor_splash=yes module_camera_enabled=no module_mobile_vr_enabled=no module_upnp_enabled=no module_websocket_enabled=no module_csg_enabled=yes module_gridmap_enabled=yes use_static_cpp=yes builtin_freetype=yes builtin_libpng=yes builtin_zlib=yes builtin_libwebp=yes builtin_libvorbis=yes builtin_libogg=yes disable_3d=no
+  SCONS_CACHE_MSVC_CONFIG: true
+
+concurrency:
+  group: double-${{github.actor}}-${{github.head_ref || github.run_number}}-${{github.ref}}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "Windows Editor (double)"
+            os: "windows-latest"
+            id: windows-editor-double
+            platform: windows
+            target: editor
+            sconsflags: debug_symbols=no tests=yes
+            rust-arch: x86_64-pc-windows-msvc
+            alt-rust-arch: none
+            # precision=double adds the ".double" token; matrix.bin is the single
+            # source of truth used by the sanity check and the tests below.
+            bin: ./bin/godot.windows.editor.double.x86_64.exe
+
+    steps:
+      - name: Set git to use LF
+        if: matrix.platform == 'windows'
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - name: checkout-godot
+        uses: actions/checkout@v4
+        with:
+          repository: ${{env.GODOT_REPOSITORY}}
+          ref: ${{env.GODOT_MAIN_SYNC_REF}}
+
+      - name: checkout-gdsdecomp
+        uses: actions/checkout@v4
+        with:
+          path: modules/gdsdecomp
+          fetch-depth: 0
+
+      - name: copy actions
+        shell: bash
+        run: |
+          cp -R modules/gdsdecomp/.github/actions/* .github/actions/
+
+      - name: Restore Godot build cache
+        uses: ./.github/actions/godot-cache-restore
+        id: restore-cache
+        with:
+          cache-name: ${{ matrix.id }}-${{ matrix.target }}
+        continue-on-error: true
+
+      - name: Setup python and scons
+        uses: ./.github/actions/godot-deps
+
+      - name: Download pre-built ANGLE
+        if: matrix.platform == 'macos' || matrix.platform == 'windows'
+        shell: sh
+        id: angle-sdk
+        run: |
+          if python ./misc/scripts/install_angle.py; then
+            echo "ANGLE_ENABLED=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::ANGLE SDK installation failed, building without ANGLE support."
+            echo "ANGLE_ENABLED=no" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download Direct3D 12 SDK components
+        if: matrix.platform == 'windows'
+        shell: sh
+        id: d3d12-sdk
+        run: |
+          if python ./misc/scripts/install_d3d12_sdk_windows.py; then
+            echo "D3D12_ENABLED=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Windows: Direct3D 12 SDK installation failed, building without Direct3D 12 support."
+            echo "D3D12_ENABLED=no" >> "$GITHUB_OUTPUT"
+          fi
+        continue-on-error: true
+
+      - name: Show targets
+        shell: sh
+        run: |
+          rustc --print=target-list
+
+      - name: Rust Add target
+        shell: sh
+        run: |
+          rustup target add ${{ matrix.rust-arch }}
+
+      - name: Rust Add alt target
+        if: matrix.alt-rust-arch != 'none'
+        shell: sh
+        run: |
+          rustup target add ${{ matrix.alt-rust-arch }}
+
+      - name: setup-dotnet
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Compile Editor
+        if: matrix.target == 'editor'
+        id: compile-editor
+        uses: ./.github/actions/godot-build
+        with:
+          scons-flags: ${{ env.SCONSFLAGS }} ${{ matrix.sconsflags }} ${{ inputs.scons-extra-flags }}
+          platform: ${{ matrix.platform }}
+          target: editor
+
+      # Fail fast, before caching/uploading, if the expected double binary is
+      # missing or does not run. GDRE hijacks --version/--gdre-version
+      # (utility/cli_helper.h) and exits non-zero by design, so --godot-version
+      # is used: it rewrites to the engine's own --version and exits 0.
+      - name: "sanity check: the double binary runs"
+        if: matrix.target == 'editor'
+        shell: bash
+        run: |
+          ${{matrix.bin}} --godot-version
+
+      - name: Save Godot build cache
+        uses: ./.github/actions/godot-cache-save
+        with:
+          cache-name: ${{ matrix.id }}-${{ matrix.target }}
+        continue-on-error: true
+
+      - name: Prepare template artifact
+        if: matrix.platform != 'android'
+        uses: ./.github/actions/godot-prepare-artifact
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.upload-artifact }}
+        with:
+          name: GDRE_tools-double-${{ matrix.target }}-${{ matrix.platform }}
+          path: ${{github.workspace}}/bin/*
+          retention-days: 90
+
+      - name: run tests
+        continue-on-error: true
+        if: matrix.target == 'editor'
+        shell: bash
+        run: |
+          ${{matrix.bin}} --headless --test --force-colors "--test-case=[GDSDecomp]*"
